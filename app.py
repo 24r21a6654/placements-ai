@@ -15,7 +15,7 @@ from langserve import add_routes
 
 # --- 1. LLM ---
 llm = ChatGoogleGenerativeAI(
-    model="gemma-4-31b-it",
+    model="gemma-2-27b-it",
     google_api_key=os.environ.get("GOOGLE_API_KEY"),
     temperature=0.3,
 )
