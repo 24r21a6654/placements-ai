@@ -1,32 +1,28 @@
-import io
 import os
-import traceback
-
+import io
 import requests
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 from pypdf import PdfReader
-
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
+from langchain_core.runnables import RunnableLambda
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.tools import DuckDuckGoSearchResults
 from langchain.agents import create_agent
+from langserve import add_routes
 
 # --- 1. LLM ---
-# NOTE: "gemma-4-31b-it" is not a valid Gemini Developer API model name.
-# Use a real Gemini model (see https://ai.google.dev/gemini-api/docs/models for the current list).
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
+    model="gemma-2-27b-it",
     google_api_key=os.environ.get("GOOGLE_API_KEY"),
     temperature=0.3,
 )
 
 search_engine = DuckDuckGoSearchResults()
 
-
-# --- 2. Tools ---
+# --- 2. Tools (identical to the notebook versions) ---
 @tool
 def job_search(role: str) -> str:
     """Search the web for current job openings matching a given role."""
@@ -63,7 +59,7 @@ def project_ideas(missing_skills: str) -> str:
 def github_check(github_username: str) -> str:
     """Check a student's GitHub profile for recent public repo activity and languages used."""
     url = f"https://api.github.com/users/{github_username}/repos?sort=updated&per_page=5"
-    response = requests.get(url, timeout=10)
+    response = requests.get(url)
     if response.status_code != 200:
         return f"Could not fetch GitHub data for user: {github_username}"
     repos = response.json()
@@ -90,6 +86,13 @@ career_agent = create_agent(
 )
 
 
+# --- 3. Shared schema + helpers ---
+class CareerAgentInput(BaseModel):
+    resume_text: str = Field(..., description="Full text extracted from the student's resume PDF")
+    target_role: str = Field(..., description="Role the student is targeting, e.g. 'Machine Learning Engineer'")
+    github_username: str = Field(..., description="Student's GitHub username")
+
+
 def extract_final_text(agent_result: dict) -> str:
     for msg in reversed(agent_result.get("messages", [])):
         if msg.__class__.__name__ != "AIMessage":
@@ -104,17 +107,11 @@ def extract_final_text(agent_result: dict) -> str:
     return ""
 
 
-def extract_pdf_text(file_bytes: bytes) -> str:
-    reader = PdfReader(io.BytesIO(file_bytes))
-    text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    return text.strip()
-
-
-def run_career_agent(resume_text: str, target_role: str, github_username: str) -> dict:
+def run_career_agent(payload: CareerAgentInput) -> dict:
     query = (
-        f"My target role is '{target_role}'. "
-        f"My GitHub username is '{github_username}'. "
-        f"Here is my resume:\n{resume_text}\n\n"
+        f"My target role is '{payload.target_role}'. "
+        f"My GitHub username is '{payload.github_username}'. "
+        f"Here is my resume:\n{payload.resume_text}\n\n"
         f"Please find job openings, analyze my skill gaps, suggest projects, "
         f"and check my GitHub activity."
     )
@@ -126,66 +123,145 @@ def run_career_agent(resume_text: str, target_role: str, github_username: str) -
         for tc in msg.tool_calls
     ]
     return {
-        "student_role": target_role,
-        "github_username": github_username,
+        "student_role": payload.target_role,
+        "github_username": payload.github_username,
         "tools_used": tool_calls_made,
         "final_summary": extract_final_text(result),
     }
 
 
-# --- 3. FastAPI app ---
+career_chain = RunnableLambda(run_career_agent)
+
+# --- 4. FastAPI app ---
 app = FastAPI(title="Placement-Ready AI Career Agent")
 
-# Allow the frontend (hosted anywhere) to call this API.
-# Tighten allow_origins to your actual frontend domain once you know it.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Text-based route - good for programmatic callers that already have resume
+# text, and for LangServe's own /career-agent/playground UI.
+add_routes(app, career_chain, path="/career-agent", playground_type="default")
 
 
-@app.get("/")
-def health():
-    return {"status": "ok"}
-
-
-@app.post("/career-agent")
-async def career_agent_endpoint(
-    resume: UploadFile = File(..., description="Resume PDF file"),
+# --- 5. PDF upload route (the actual API used by the homepage form below) ---
+@app.post("/career-agent/upload")
+async def career_agent_upload(
+    resume_pdf: UploadFile = File(..., description="Student's resume as a PDF file"),
     target_role: str = Form(...),
     github_username: str = Form(...),
 ):
-    # Validate file type up front so we fail with a clean 400, not a crash.
-    if resume.content_type not in ("application/pdf", "application/octet-stream") and not resume.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Please upload a PDF file for the resume.")
+    if resume_pdf.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="resume_pdf must be a PDF file")
 
+    pdf_bytes = await resume_pdf.read()
     try:
-        file_bytes = await resume.read()
-        resume_text = extract_pdf_text(file_bytes)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not read PDF: {exc}")
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        resume_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
 
-    if not resume_text:
-        raise HTTPException(
-            status_code=400,
-            detail="No extractable text found in the PDF (it may be a scanned image).",
-        )
+    if not resume_text.strip():
+        raise HTTPException(status_code=400, detail="No extractable text found in PDF")
 
-    try:
-        result = run_career_agent(resume_text, target_role, github_username)
-        return JSONResponse(content=result)
-    except Exception as exc:
-        # Log the full traceback server-side (visible in Render logs) but
-        # return a clean JSON error to the frontend instead of an HTML 500 page.
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Agent run failed: {exc}")
+    payload = CareerAgentInput(
+        resume_text=resume_text,
+        target_role=target_role,
+        github_username=github_username,
+    )
+    return run_career_agent(payload)
+
+
+# --- 6. NEW: homepage with a direct PDF-upload form ---
+# So students can go straight to the root URL and upload a PDF, instead of
+# navigating through /docs and finding /career-agent/upload manually.
+HOMEPAGE_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Placement-Ready AI Career Agent</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }
+    h1 { font-size: 1.4rem; }
+    label { display: block; margin-top: 16px; font-weight: 600; font-size: 0.9rem; }
+    input[type=text], input[type=file] {
+      width: 100%; padding: 8px; margin-top: 6px; box-sizing: border-box;
+      border: 1px solid #ccc; border-radius: 6px; font-size: 0.95rem;
+    }
+    button {
+      margin-top: 20px; padding: 10px 20px; border: none; border-radius: 6px;
+      background: #4f46e5; color: white; font-size: 0.95rem; cursor: pointer;
+    }
+    button:disabled { background: #a5a5a5; cursor: not-allowed; }
+    #status { margin-top: 16px; font-size: 0.9rem; color: #555; }
+    pre {
+      margin-top: 16px; background: #f5f5f7; padding: 14px; border-radius: 8px;
+      white-space: pre-wrap; word-wrap: break-word; font-size: 0.85rem;
+    }
+  </style>
+</head>
+<body>
+  <h1>🎓 Placement-Ready AI Career Agent</h1>
+  <p>Upload your resume PDF, tell it your target role and GitHub username, and it'll search jobs, find skill gaps, suggest projects, and check your GitHub activity.</p>
+
+  <form id="agentForm">
+    <label for="resume_pdf">Resume (PDF)</label>
+    <input type="file" id="resume_pdf" name="resume_pdf" accept="application/pdf" required />
+
+    <label for="target_role">Target Role</label>
+    <input type="text" id="target_role" name="target_role" placeholder="e.g. Machine Learning Engineer" required />
+
+    <label for="github_username">GitHub Username</label>
+    <input type="text" id="github_username" name="github_username" placeholder="e.g. octocat" required />
+
+    <button type="submit" id="submitBtn">Run Career Agent</button>
+  </form>
+
+  <div id="status"></div>
+  <pre id="result" style="display:none;"></pre>
+
+  <script>
+    const form = document.getElementById("agentForm");
+    const statusEl = document.getElementById("status");
+    const resultEl = document.getElementById("result");
+    const submitBtn = document.getElementById("submitBtn");
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      resultEl.style.display = "none";
+      submitBtn.disabled = true;
+      statusEl.textContent = "Running agent... this can take 20-60 seconds.";
+
+      const formData = new FormData();
+      formData.append("resume_pdf", document.getElementById("resume_pdf").files[0]);
+      formData.append("target_role", document.getElementById("target_role").value);
+      formData.append("github_username", document.getElementById("github_username").value);
+
+      try {
+        const res = await fetch("/career-agent/upload", { method: "POST", body: formData });
+        const data = await res.json();
+        if (!res.ok) {
+          statusEl.textContent = "Error: " + (data.detail || res.statusText);
+        } else {
+          statusEl.textContent = "Done.";
+          resultEl.style.display = "block";
+          resultEl.textContent = JSON.stringify(data, null, 2);
+        }
+      } catch (err) {
+        statusEl.textContent = "Request failed: " + err;
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def homepage():
+    return HOMEPAGE_HTML
 
 
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
